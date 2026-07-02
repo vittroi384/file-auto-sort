@@ -97,10 +97,18 @@ AUTO_DEPTH = 1
 # [자동 모드] 숫자/날짜로만 된 단어(2026, 06, 153022 등)는 폴더 이름으로 쓰지 않음
 AUTO_SKIP_NUMERIC = True
 
-ASK_BEFORE_CREATE = True        # 새 폴더 만들 때 확인 창
+ASK_BEFORE_CREATE = True        # 새 폴더 만들 때 확인 창 (아래 REVIEW_AFTER_SORT 가 켜져 있으면 무시됨)
 PLAY_ALARM_SOUND = True         # 새 폴더 확인 시 알람음
 TOAST_ON_MOVE = True            # 정리될 때마다 토스트 알림
 HIDE_CONSOLE = True             # 트레이가 있으면 검은 창 숨김
+
+# ★ 정리 후 '결과 검토' 모드 (피드백 반영)
+#   True  : 파일마다 확인창을 띄우지 않고 '알아서' 정리한 뒤,
+#           결과를 폴더별로 한 번에 보여주고 [이대로 둘게요] / [모두 되돌리기] 로 결정.
+#           (파일이 200개여도 확인창은 1개 — 하나씩 엔터 칠 필요 없음)
+#   False : 예전 방식(새 폴더마다 확인창을 띄우는 ASK_BEFORE_CREATE)을 사용.
+REVIEW_AFTER_SORT = True
+REVIEW_DEBOUNCE_SEC = 3         # 마지막 파일이 정리된 뒤, 새 파일이 이 시간(초)간 없으면 결과 창을 띄움
 
 # ★ 기존 폴더로 보내기(분배) 모드
 #   True  : 정리함에 넣은 파일을, 아래 '보낼곳'들 안에 '이미 있는 같은 이름 폴더'로 보냄
@@ -180,6 +188,9 @@ state = {
     "console_visible": True,
     "open_settings": False,   # 트레이에서 설정창 열기 요청 플래그 (메인 스레드가 처리)
     "pending_onboarding": False,  # 첫 실행 설정 후 안내 창을 띄울지 (메인 스레드가 처리)
+    "open_review": False,     # 정리 결과 검토 창 열기 요청 (메인 스레드가 처리)
+    "batch": [],              # 이번 정리분(검토 대기 중): (이동경로, 원래폴더, 원래파일명, 표시폴더) 목록
+    "last_sort_ts": 0.0,      # 마지막으로 파일을 실제 이동한 시각 (결과창 debounce용)
 }
 _rules_cache = {"mtime": None, "rules": []}
 
@@ -631,6 +642,7 @@ def sort_file(filepath, base_folder):
                 undo_stack.append((target, base_folder, filename))
                 if len(undo_stack) > 100:
                     undo_stack.pop(0)
+                record_for_review(target, base_folder, filename, os.path.basename(existing))
                 log(f"이동(기존 폴더): {filename}  ->  {existing}")
                 if TOAST_ON_MOVE:
                     notify("정리 완료", f"{filename}\n→ {os.path.basename(existing)} (기존 폴더)")
@@ -640,7 +652,7 @@ def sort_file(filepath, base_folder):
 
     dest_folder = os.path.join(base_folder, folder_name)
     if not os.path.exists(dest_folder):
-        if ASK_BEFORE_CREATE:
+        if ASK_BEFORE_CREATE and not REVIEW_AFTER_SORT:
             chosen = ask_folder_dialog(filename, folder_name)
             if chosen is None:
                 log(f"[건너뜀] 사용자 선택: {filename}")
@@ -661,6 +673,7 @@ def sort_file(filepath, base_folder):
             undo_stack.append((target, base_folder, filename))
             if len(undo_stack) > 100:
                 undo_stack.pop(0)
+            record_for_review(target, base_folder, filename, folder_name)
             log(f"이동: {filename}  ->  {folder_name}\\")
             if TOAST_ON_MOVE:
                 notify("정리 완료", f"{filename}\n→ {folder_name}")
@@ -693,6 +706,122 @@ def do_undo():
         except Exception as ex:
             log(f"[실패] 실행취소: {ex}")
             notify("실행취소 실패", str(ex))
+
+
+def record_for_review(target, home, name, disp):
+    """방금 옮긴 파일 1건을 '이번 정리분'에 기록한다.
+    결과 검토 창에서 폴더별로 보여주고, [모두 되돌리기] 시 한꺼번에 원위치하기 위함."""
+    if not REVIEW_AFTER_SORT:
+        return
+    state["batch"].append((target, home, name, disp))
+    state["last_sort_ts"] = time.time()
+
+
+def rollback_batch(entries):
+    """이번 정리분(entries)을 통째로 원래 위치(감시 폴더)로 되돌린다.
+    - 파일을 원래 폴더로 이동
+    - 그 과정에서 비어버린 하위 폴더는 정리
+    - undo_stack 에서도 해당 항목을 제거해 이중 되돌리기를 막는다."""
+    restored, failed = 0, 0
+    with move_lock:
+        for target, home, name, _disp in reversed(entries):
+            if not os.path.exists(target):
+                continue
+            try:
+                back = unique_path(home, name)
+                moved_from = os.path.dirname(target)
+                shutil.move(target, back)
+                # undo_stack 에서도 같은 항목 제거 (이중 되돌리기 방지)
+                for i in range(len(undo_stack) - 1, -1, -1):
+                    if undo_stack[i][0] == target:
+                        undo_stack.pop(i)
+                        break
+                # 비어버린 폴더 정리 (감시 폴더까지 거슬러 올라가며)
+                d = moved_from
+                while d and os.path.normpath(d) != os.path.normpath(home):
+                    try:
+                        if os.path.isdir(d) and not os.listdir(d):
+                            parent = os.path.dirname(d)
+                            os.rmdir(d)
+                            d = parent
+                        else:
+                            break
+                    except Exception:
+                        break
+                restored += 1
+            except Exception as ex:
+                failed += 1
+                log(f"[실패] 되돌리기 {name}: {ex}")
+    log(f"[정리분 되돌림] 성공 {restored}건 / 실패 {failed}건")
+    notify("모두 되돌렸어요",
+           f"{restored}건을 원래 위치로 되돌렸습니다." + (f" (실패 {failed}건)" if failed else ""))
+
+
+def show_review_window():
+    """이번에 정리한 결과를 폴더별로 보여주고,
+    [이대로 둘게요] 또는 [모두 되돌리기] 중 하나로 한 번에 결정하게 한다.
+    (파일마다 확인창을 띄우지 않기 위한 UI — 피드백 반영)"""
+    entries = list(state["batch"])
+    state["batch"] = []   # 창을 여는 순간 스냅샷 — 이후 들어오는 파일은 다음 배치로
+    if not entries:
+        return
+
+    # GUI 가 없으면(트레이/tk 미탑재) 로그로만 남기고, 이동은 이미 됐으므로 그대로 둔다
+    if not (HAS_TK and tk_root is not None):
+        log(f"[정리 결과] {len(entries)}건 정리됨 (GUI 없음 — 트레이/메뉴에서 되돌리기 가능)")
+        return
+
+    from collections import Counter
+    counts = Counter(disp for (_t, _h, _n, disp) in entries)
+
+    win = tk.Toplevel(tk_root)
+    win.title("정리 결과 — 이대로 둘까요?")
+    win.attributes("-topmost", True)
+    win.geometry("470x470")
+    try:
+        win.lift(); win.focus_force()
+    except Exception:
+        pass
+
+    FONT_T = ("맑은 고딕", 12, "bold")
+    FONT   = ("맑은 고딕", 10)
+    FONT_S = ("맑은 고딕", 9)
+
+    pad = tk.Frame(win, padx=16, pady=14)
+    pad.pack(fill="both", expand=True)
+
+    tk.Label(pad, text=f"파일 {len(entries)}개를 이렇게 정리했어요.",
+             font=FONT_T).pack(anchor="w")
+    tk.Label(pad, text="맘에 들면 [이대로 둘게요], 아니면 [모두 되돌리기] 를 누르세요.",
+             font=FONT_S, fg="#444", justify="left").pack(anchor="w", pady=(2, 10))
+
+    # 폴더별 집계 목록 (스크롤)
+    frame = tk.Frame(pad)
+    frame.pack(fill="both", expand=True)
+    sb = tk.Scrollbar(frame)
+    sb.pack(side="right", fill="y")
+    lb = tk.Listbox(frame, font=FONT, yscrollcommand=sb.set)
+    lb.pack(side="left", fill="both", expand=True)
+    sb.config(command=lb.yview)
+    for folder, n in sorted(counts.items(), key=lambda x: (-x[1], x[0])):
+        lb.insert("end", f"  📁 {folder}   —  {n}개")
+
+    def keep():
+        log(f"[정리 결과] 확정: {len(entries)}건 유지")
+        win.destroy()
+
+    def rollback():
+        win.destroy()
+        rollback_batch(entries)
+
+    bar = tk.Frame(pad)
+    bar.pack(fill="x", pady=(12, 0))
+    tk.Button(bar, text="모두 되돌리기", font=FONT, command=rollback).pack(side="left")
+    tk.Button(bar, text="이대로 둘게요", font=("맑은 고딕", 10, "bold"),
+              command=keep).pack(side="right")
+
+    win.protocol("WM_DELETE_WINDOW", keep)  # 창을 그냥 닫으면 = 유지(안전)
+    tk_root.wait_window(win)
 
 
 def enqueue_existing():
@@ -829,12 +958,32 @@ def open_settings_window():
 
     win = tk.Toplevel(tk_root)
     win.title("파일 자동 정리 - 설정")
-    win.attributes("-topmost", True)
-    win.geometry("560x640")
+    # [수정] 항상 위(topmost) 제거 — 다른 창을 가리지 않도록. 열 때 한 번만 앞으로 가져옴.
+    win.minsize(420, 320)
     try:
         win.lift(); win.focus_force()
     except Exception:
         pass
+
+    # [수정] 내용이 길어 아래(라디오 버튼 등)가 잘리던 문제 →
+    #        스크롤 가능한 본문(body)에 담고, 저장/취소는 맨 아래 고정.
+    #        창 크기는 함수 끝에서 내용에 맞춰 동적으로 잡는다.
+    _outer = tk.Frame(win)
+    _outer.pack(side="top", fill="both", expand=True)
+    _canvas = tk.Canvas(_outer, highlightthickness=0)
+    _vsb = tk.Scrollbar(_outer, orient="vertical", command=_canvas.yview)
+    _canvas.configure(yscrollcommand=_vsb.set)
+    _vsb.pack(side="right", fill="y")
+    _canvas.pack(side="left", fill="both", expand=True)
+    body = tk.Frame(_canvas)
+    _body_id = _canvas.create_window((0, 0), window=body, anchor="nw")
+    _canvas.bind("<Configure>", lambda e: _canvas.itemconfigure(_body_id, width=e.width))
+    body.bind("<Configure>", lambda e: _canvas.configure(scrollregion=_canvas.bbox("all")))
+
+    def _wheel(e):
+        _canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+    _canvas.bind("<Enter>", lambda e: _canvas.bind_all("<MouseWheel>", _wheel))
+    _canvas.bind("<Leave>", lambda e: _canvas.unbind_all("<MouseWheel>"))
 
     FONT = ("맑은 고딕", 10)
     FONT_B = ("맑은 고딕", 11, "bold")
@@ -884,23 +1033,23 @@ def open_settings_window():
             tk.Button(qf, text="바탕화면", command=lambda: add_known("desktop")).pack(side="left", padx=3)
         return lb
 
-    tk.Label(win, text="파일을 어디에 넣고, 어디로 정리할지 폴더만 골라주세요.",
+    tk.Label(body, text="파일을 어디에 넣고, 어디로 정리할지 폴더만 골라주세요.",
              font=FONT_B).pack(anchor="w", padx=12, pady=(12, 0))
 
     watch_lb = make_folder_section(
-        win, "1. 정리할 폴더",
+        body, "1. 정리할 폴더",
         "여기에 넣은 파일들이 이름을 보고 자동으로 하위 폴더로 정리됩니다.",
         active_folders,
     )
     dest_lb = make_folder_section(
-        win, "2. 보낼 곳 (선택)",
+        body, "2. 보낼 곳 (선택)",
         "정리함에 넣은 파일을, 이 폴더들 안에 '이미 있는 같은 이름 폴더'로 보냅니다. "
         "없으면 비워두어도 됩니다.",
         dest_roots,
     )
 
     # 간단 옵션
-    opt = tk.LabelFrame(win, text="옵션", font=FONT_B, padx=10, pady=6)
+    opt = tk.LabelFrame(body, text="옵션", font=FONT_B, padx=10, pady=6)
     opt.pack(fill="x", padx=12, pady=8)
     v_send = tk.BooleanVar(value=SEND_TO_EXISTING)
     v_alarm = tk.BooleanVar(value=PLAY_ALARM_SOUND)
@@ -930,11 +1079,25 @@ def open_settings_window():
             pass
         win.destroy()
 
+    # [수정] 저장/취소 버튼은 스크롤 영역 밖, 창 맨 아래에 고정 (내용이 길어도 항상 보이게)
     bar = tk.Frame(win)
-    bar.pack(fill="x", padx=12, pady=12)
+    bar.pack(side="bottom", fill="x", padx=12, pady=12)
     tk.Button(bar, text="저장하고 닫기", font=FONT_B, height=1,
               command=save_and_close).pack(side="right")
     tk.Button(bar, text="취소", command=win.destroy).pack(side="right", padx=8)
+    tk.Frame(win, height=1, bg="#dddddd").pack(side="bottom", fill="x")
+
+    # [수정] 내용 높이에 맞춰 창 크기를 동적으로 잡되, 화면을 넘으면 화면에 맞춤(→ 스크롤로 봄)
+    win.update_idletasks()
+    try:
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        req_w = max(560, body.winfo_reqwidth() + _vsb.winfo_reqwidth() + 4)
+        content_h = body.winfo_reqheight() + bar.winfo_reqheight() + 12
+        w = min(req_w, sw - 80)
+        h = min(content_h, sh - 100)
+        win.geometry(f"{w}x{h}")
+    except Exception:
+        win.geometry("560x680")
 
     tk_root.wait_window(win)
 
@@ -1261,12 +1424,22 @@ def main():
                         show_onboarding()
                 except Exception as ex:
                     log(f"[경고] 설정창 오류: {ex}")
+            # 정리 결과 검토 창 요청 처리 (창은 메인 스레드에서 열어야 안전)
+            if state.get("open_review"):
+                state["open_review"] = False
+                try:
+                    show_review_window()
+                except Exception as ex:
+                    log(f"[경고] 결과 창 오류: {ex}")
             if not state["paused"]:
                 try:
                     fp, base = file_queue.get(timeout=0.3)
                     sort_file(fp, base)
                 except queue.Empty:
-                    pass
+                    # 새 파일이 잠잠하면(debounce), 이번 정리분 결과 창을 띄운다
+                    if (REVIEW_AFTER_SORT and state["batch"]
+                            and (time.time() - state["last_sort_ts"]) >= REVIEW_DEBOUNCE_SEC):
+                        state["open_review"] = True
             else:
                 time.sleep(0.3)
             if tk_root is not None:
