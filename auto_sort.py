@@ -6,7 +6,7 @@
 
 주요 기능
  - 새 폴더가 필요하면 알람 + 확인 창(이름 수정/건너뛰기)
- - 키워드 여러 개 걸리면 폴더 안의 폴더로 (예: 진흥원\서부초등학교)
+ - 키워드 여러 개 걸리면 폴더 안의 폴더로 (예: 발주기관\다라초등학교)
  - 트레이 아이콘으로 조용히 실행 (우클릭 메뉴)
  - 실행취소(방금 정리 되돌리기)
  - 윈도우 토스트 알림
@@ -409,7 +409,7 @@ def candidate_words(filename, rules):
     '기존 폴더로 보내기'에서 찾을 단어들.
     파일 이름의 아무 단어에나 반응하면 엉뚱한 폴더로 새어나가므로,
     실제 분류에 쓰이는 '대표 폴더 이름'의 단계들만 후보로 씁니다.
-    (예: 20260617_춘천고등학교_견적서 → 대표단어 '춘천고등학교'만 확인,
+    (예: 20260617_가나고등학교_견적서 → 대표단어 '가나고등학교'만 확인,
          '견적서'처럼 뒤에 붙은 일반 단어로는 보내지 않음)
     """
     words = []
@@ -1058,12 +1058,12 @@ def open_settings_window():
 
     tk.Label(opt, text="폴더 깊이 — 파일 이름으로 폴더를 몇 단계까지 만들지",
              font=FONT).pack(anchor="w", pady=(8, 0))
-    tk.Label(opt, text="예)  20260617_춘천고등학교_견적서.xlsx",
+    tk.Label(opt, text="예)  20260617_가나고등학교_견적서.xlsx",
              font=("맑은 고딕", 9), fg="#555").pack(anchor="w")
     v_depth = tk.IntVar(value=AUTO_DEPTH if AUTO_DEPTH in (0, 1, 2) else 1)
     drow = tk.Frame(opt); drow.pack(anchor="w")
-    tk.Radiobutton(drow, text="한 단계 (춘천고등학교)", variable=v_depth, value=1, font=FONT).pack(side="left")
-    tk.Radiobutton(drow, text="두 단계 (춘천고등학교\\견적서)", variable=v_depth, value=2, font=FONT).pack(side="left")
+    tk.Radiobutton(drow, text="한 단계 (가나고등학교)", variable=v_depth, value=1, font=FONT).pack(side="left")
+    tk.Radiobutton(drow, text="두 단계 (가나고등학교\\견적서)", variable=v_depth, value=2, font=FONT).pack(side="left")
     tk.Radiobutton(drow, text="전부", variable=v_depth, value=0, font=FONT).pack(side="left")
 
     def save_and_close():
