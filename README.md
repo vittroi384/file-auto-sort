@@ -5,7 +5,7 @@
 
 ## 스크린샷
 
-![설정 화면](assets/settings.png)
+<p align="center"><img src="assets/settings.png" width="360" alt="설정 화면"></p>
 
 *설정 화면 — 정리할 폴더·보낼 곳 지정, 폴더 깊이 규칙 (그림의 예시는 가상 명칭)*
 
